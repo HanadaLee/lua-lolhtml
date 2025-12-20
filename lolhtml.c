@@ -28,25 +28,23 @@ typedef struct {
     int callback_index;
 } handler_data_t;
 
-static void push_lol_str_maybe(lua_State *L, lol_html_str_t *s) {
-    if (s == NULL) {
+static void push_lol_str_maybe(lua_State *L, lol_html_str_t s) {
+    if (s.len == 0) {
         lua_pushnil(L);
     } else {
-        lua_pushlstring(L, s->data, s->len);
-        lol_html_str_free(*s);
-        free(s);
+        lua_pushlstring(L, s.data, s.len);
+        lol_html_str_free(s);
     }
 }
 
 static int push_last_error(lua_State *L) {
-    lol_html_str_t *err = lol_html_take_last_error();
+    lol_html_str_t err = lol_html_take_last_error();
     lua_pushnil(L);
-    if (err == NULL) {
+    if (err.len == 0) {
         lua_pushliteral(L, "unknown error");
     } else {
-        lua_pushlstring(L, err->data, err->len);
-        lol_html_str_free(*err);
-        free(err);
+        lua_pushlstring(L, err.data, err.len);
+        lol_html_str_free(err);
     }
     return 2;
 }
@@ -263,7 +261,7 @@ static int text_chunk_get_text(lua_State *L) {
 }
 
 static int text_chunk_is_last_in_text_node(lua_State *L) {
-    const lol_html_text_chunk_t **chunk = check_valid_udata(L, 1, PREFIX "text_chunk");
+    lol_html_text_chunk_t **chunk = check_valid_udata(L, 1, PREFIX "text_chunk");
     lua_pushboolean(L, lol_html_text_chunk_is_last_in_text_node(*chunk));
     return 1;
 }
