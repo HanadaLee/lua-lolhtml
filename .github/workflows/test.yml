@@ -1,4 +1,4 @@
-name: Test
+name: Test and publish
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: test-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
@@ -37,9 +37,83 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential libluajit-5.1-dev luajit
+            build-essential libluajit-5.1-dev luajit curl zip unzip
           rustup toolchain install "${{ matrix.rust }}" --profile minimal
           rustup default "${{ matrix.rust }}"
 
       - name: Build and test the LuaJIT binding
         run: bash util/run-tests.sh
+
+      - name: Install LuaRocks
+        run: |
+          bash util/setup-luarocks.sh "$RUNNER_TEMP/luarocks"
+          echo "$RUNNER_TEMP/luarocks/bin" >> "$GITHUB_PATH"
+
+      - name: Test LuaRocks installation
+        run: |
+          rockspec="$(find rockspecs -name 'lua-lolhtml-*.rockspec' | sort -V | tail -n 1)"
+          luarocks lint "$rockspec"
+          make clean
+          luarocks --lua-version=5.1 --tree="$RUNNER_TEMP/rock-tree" make "$rockspec"
+          LUA_PATH="$PWD/.ci/telescope/?.lua;;" \
+          LUA_CPATH="$RUNNER_TEMP/rock-tree/lib/lua/5.1/?.so" \
+            luajit .ci/telescope/tsc spec/lolhtml.lua
+
+  publish:
+    if: github.repository == 'HanadaLee/lua-lolhtml' && startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check out Telescope
+        uses: actions/checkout@v6
+        with:
+          repository: jdesgats/telescope
+          path: .ci/telescope
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libluajit-5.1-dev luajit curl zip unzip
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
+          bash util/setup-luarocks.sh "$RUNNER_TEMP/luarocks"
+          echo "$RUNNER_TEMP/luarocks/bin" >> "$GITHUB_PATH"
+
+      - name: Pack and test release sources
+        id: package
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rockspec="rockspecs/lua-lolhtml-${GITHUB_REF_NAME}-1.rockspec"
+          source_rock="lua-lolhtml-${GITHUB_REF_NAME}-1.src.rock"
+          luajit - "$rockspec" "$GITHUB_REF_NAME" <<'LUA'
+          local spec = {}
+          setfenv(assert(loadfile(arg[1])), spec)()
+          assert(spec.package == "lua-lolhtml")
+          assert(spec.version == arg[2] .. "-1")
+          assert(spec.source.tag == arg[2])
+          assert(spec.source.url == "git+https://github.com/HanadaLee/lua-lolhtml.git")
+          LUA
+          luarocks lint "$rockspec"
+          luarocks pack "$rockspec"
+          luarocks --lua-version=5.1 --tree="$RUNNER_TEMP/rock-tree" install "$source_rock"
+          LUA_PATH="$PWD/.ci/telescope/?.lua;;" \
+          LUA_CPATH="$RUNNER_TEMP/rock-tree/lib/lua/5.1/?.so" \
+            luajit .ci/telescope/tsc spec/lolhtml.lua
+          echo "rockspec=$rockspec" >> "$GITHUB_OUTPUT"
+          echo "source_rock=$source_rock" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to LuaRocks
+        env:
+          LUAROCKS_API_KEY: ${{ secrets.LUAROCKS_API_KEY }}
+          ROCKSPEC: ${{ steps.package.outputs.rockspec }}
+          SOURCE_ROCK: ${{ steps.package.outputs.source_rock }}
+        run: |
+          test -n "$LUAROCKS_API_KEY"
+          luarocks upload "$ROCKSPEC" "$SOURCE_ROCK" --temp-key "$LUAROCKS_API_KEY"

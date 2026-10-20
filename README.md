@@ -19,8 +19,10 @@ distribution's package manager.
 You can install this module with Luarocks:
 
 ```
-luarocks install https://raw.githubusercontent.com/jdesgats/lua-lolhtml/master/rockspecs/lolhtml-dev-1.rockspec
+luarocks install lua-lolhtml 1.0.1-1
 ```
+
+The package is named `lua-lolhtml`; load it with `require "lolhtml"`.
 
 ### Manual build
 
@@ -28,7 +30,7 @@ First, be sure to clone this repository with its submodules. Then the provided
 Makefile should be able to build the module.
 
 ```
-git clone --recursive https://github.com/jdesgats/lua-lolhtml.git
+git clone --recursive https://github.com/HanadaLee/lua-lolhtml.git
 make
 ```
 
