@@ -10,7 +10,7 @@ on-the-fly.
 Installation
 ------------
 
-You need a functional setup of Rust and Cargo to be able to build this module.
+You need Rust 1.89 or newer and Cargo to be able to build this module.
 Please refer to the [Rust website][rust-install] or install it with your
 distribution's package manager.
 

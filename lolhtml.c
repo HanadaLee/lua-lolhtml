@@ -680,7 +680,7 @@ static void sink_callback(const char *chunk, size_t chunk_len, void *user_data) 
 static int rewriter_new(lua_State *L) {
     size_t encoding_len;
     const char *encoding;
-    lol_html_memory_settings_t memory_settings;
+    lol_html_memory_settings_t memory_settings = {0};
     lua_rewriter_t *rewriter;
     bool strict;
 

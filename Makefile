@@ -9,7 +9,7 @@ $(LOLHTML_STATIC_LIB):
 	[ -d lol-html ] || ( echo "need to clone submodules" >&2 ; exit 1 )
 	cd lol-html/c-api && cargo build --release --locked
 
-lolhtml.o: lolhtml.c
+lolhtml.o: lolhtml.c $(LOLHTML_SRC_DIR)/include/lol_html.h
 	$(CC) -c -o $@ $(CFLAGS) -Wall -I"$(LOLHTML_SRC_DIR)/include" -I"$(COMPAT_SRC_DIR)" -fPIC $<
 
 lolhtml.so: $(LOLHTML_STATIC_LIB) lolhtml.o

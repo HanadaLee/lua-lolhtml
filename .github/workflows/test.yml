@@ -17,6 +17,9 @@ jobs:
     if: github.repository == 'HanadaLee/lua-lolhtml'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      matrix:
+        rust: ["1.89.0", stable]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,8 +38,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential libluajit-5.1-dev luajit
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "${{ matrix.rust }}" --profile minimal
+          rustup default "${{ matrix.rust }}"
 
       - name: Build and test the LuaJIT binding
         run: bash util/run-tests.sh

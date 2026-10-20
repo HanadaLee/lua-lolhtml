@@ -126,6 +126,20 @@ describe("lolhtml rewriter", function()
         assert_equal(out, "<!--replaced--> hello <!--replaced-->")
       end)
 
+      for _, text in ipairs { "foo --> bar", "foo --!> bar", ">foo", "->foo" } do
+        test("set_text rejects comment terminator " .. text, function()
+          local called = false
+          local out = run_parser("<!--original-->", function(comment)
+            local ok, err = comment:set_text(text)
+            assert_nil(ok)
+            assert_type(err, "string")
+            called = true
+          end)
+          assert_true(called)
+          assert_equal(out, "<!--original-->")
+        end)
+      end
+
       test("before/after", function()
         local out = run_parser("hello, <!-- comment -->", function(comment)
           comment:before("<World>")
@@ -396,6 +410,105 @@ describe("lolhtml rewriter", function()
     local ok, err = lolhtml.new_selector("foo[attr=")
     assert_nil(ok)
     assert_type(err, "string")
+  end)
+
+  test("invalid encoding", function()
+    local rewriter, err = lolhtml.new_rewriter {
+      builder = lolhtml.new_rewriter_builder(),
+      encoding = "not-a-real-encoding",
+      sink = sink_buffer(),
+    }
+    assert_nil(rewriter)
+    assert_type(err, "string")
+  end)
+
+  test("memory limit leaves the rewriter broken without flushing input", function()
+    local buf = sink_buffer()
+    local builder = lolhtml.new_rewriter_builder()
+      :add_element_content_handlers {
+        selector = assert(lolhtml.new_selector("*")),
+        element_handler = function() end,
+      }
+    local rewriter = assert(lolhtml.new_rewriter {
+      builder = builder,
+      sink = buf,
+      preallocated_parsing_buffer_size = 0,
+      max_allowed_memory_usage = 100,
+    })
+    assert(rewriter:write('<img alt="' .. string.rep("l", 50)))
+    local ok, err = rewriter:write(string.rep("r", 50) .. '" />')
+    assert_nil(ok)
+    assert_type(err, "string")
+    assert_not_nil(err:lower():find("memory"))
+    assert_equal(buf:value(), "")
+
+    local ok, err = rewriter:write("tail")
+    assert_nil(ok)
+    assert_equal(err, "broken rewriter")
+    local ok, err = rewriter:close()
+    assert_nil(ok)
+    assert_equal(err, "broken rewriter")
+  end)
+
+  describe("selector matching", function()
+    local cases = {
+      {
+        name = "uppercase attribute existence",
+        selector = "[HREF]",
+        input = '<a href="x">x</a><a>y</a>',
+        output = '<a href="x" hit="">x</a><a>y</a>',
+      },
+      {
+        name = "uppercase attribute value",
+        selector = "[HREF=x]",
+        input = '<a href="x">x</a><a href="y">y</a>',
+        output = '<a href="x" hit="">x</a><a href="y">y</a>',
+      },
+      {
+        name = "nested not",
+        selector = "div:not(:not(.x))",
+        input = '<div class="x">a</div><div>b</div>',
+        output = '<div class="x" hit="">a</div><div>b</div>',
+      },
+      {
+        name = "custom element nth-of-type with mixed case",
+        selector = "x-foo:nth-of-type(2)",
+        input = "<X-Foo>a</X-Foo><x-foo>b</x-foo>",
+        output = '<X-Foo>a</X-Foo><x-foo hit="">b</x-foo>',
+      },
+      {
+        name = "SVG integration points",
+        selector = "desc,title,foreignobject",
+        input = "<svg><desc>d</desc><title>t</title><foreignObject></foreignObject></svg>",
+        output = '<svg><desc hit="">d</desc><title hit="">t</title><foreignObject hit=""></foreignObject></svg>',
+      },
+      {
+        name = "MathML integration points",
+        selector = "mi,mo,mn,annotation-xml",
+        input = "<math><mi>x</mi><mo>+</mo><mn>1</mn><annotation-xml></annotation-xml></math>",
+        output = '<math><mi hit="">x</mi><mo hit="">+</mo><mn hit="">1</mn><annotation-xml hit=""></annotation-xml></math>',
+      },
+    }
+    for _, case in ipairs(cases) do
+      test(case.name, function()
+        for _, chunk_size in ipairs { #case.input, 3 } do
+          local buf = sink_buffer()
+          local builder = lolhtml.new_rewriter_builder()
+            :add_element_content_handlers {
+              selector = assert(lolhtml.new_selector(case.selector)),
+              element_handler = function(element)
+                assert(element:set_attribute("hit", ""))
+              end,
+            }
+          local rewriter = assert(lolhtml.new_rewriter { builder=builder, sink=buf })
+          for i = 1, #case.input, chunk_size do
+            assert(rewriter:write(case.input:sub(i, i + chunk_size - 1)))
+          end
+          assert(rewriter:close())
+          assert_equal(buf:value(), case.output)
+        end
+      end)
+    end
   end)
 
   describe("element content handlers", function()
