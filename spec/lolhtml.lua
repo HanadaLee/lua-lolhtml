@@ -489,6 +489,25 @@ describe("lolhtml rewriter", function()
         output = '<math><mi hit="">x</mi><mo hit="">+</mo><mn hit="">1</mn><annotation-xml hit=""></annotation-xml></math>',
       },
     }
+    local empty_input = '<i foo="bar"></i><i foo=""></i><i foo></i><i></i>'
+    local negated_output = '<i foo="bar" hit=""></i><i foo="" hit=""></i><i foo hit=""></i><i hit=""></i>'
+    for _, operator in ipairs { "^=", "$=", "*=", "~=" } do
+      for _, modifier in ipairs { "", " i" } do
+        local selector = '[foo' .. operator .. '""' .. modifier .. ']'
+        cases[#cases + 1] = {
+          name = "empty operand " .. selector,
+          selector = selector,
+          input = empty_input,
+          output = empty_input,
+        }
+        cases[#cases + 1] = {
+          name = "negated empty operand " .. selector,
+          selector = ":not(" .. selector .. ")",
+          input = empty_input,
+          output = negated_output,
+        }
+      end
+    end
     for _, case in ipairs(cases) do
       test(case.name, function()
         for _, chunk_size in ipairs { #case.input, 3 } do
@@ -508,6 +527,136 @@ describe("lolhtml rewriter", function()
           assert_equal(buf:value(), case.output)
         end
       end)
+    end
+  end)
+
+  test("attribute metadata obeys the memory limit", function()
+    local unique = {}
+    for i = 1, 4096 do unique[i] = " a" .. i end
+    for _, attributes in ipairs { string.rep(" a", 4096), table.concat(unique) } do
+      local input = "<div" .. attributes .. ">after</div>"
+      assert_true(#input < 64 * 1024)
+      for _, chunk_size in ipairs { #input, 512, 1 } do
+        local buf, called = sink_buffer(), 0
+        local builder = lolhtml.new_rewriter_builder()
+          :add_element_content_handlers {
+            selector = assert(lolhtml.new_selector("div")),
+            element_handler = function() called = called + 1 end,
+          }
+        local rewriter = assert(lolhtml.new_rewriter {
+          builder = builder,
+          sink = buf,
+          preallocated_parsing_buffer_size = 0,
+          max_allowed_memory_usage = 64 * 1024,
+        })
+        local failure
+        for i = 1, #input, chunk_size do
+          local ok, err = rewriter:write(input:sub(i, i + chunk_size - 1))
+          if not ok then failure = err; break end
+        end
+        assert_type(failure, "string")
+        assert_not_nil(failure:lower():find("memory"))
+        assert_equal(called, 0)
+        assert_equal(buf:value(), "")
+        local ok, err = rewriter:close()
+        assert_nil(ok)
+        assert_equal(err, "broken rewriter")
+      end
+    end
+  end)
+
+  test("attribute memory is released between tags", function()
+    local input = string.rep("<div" .. string.rep(" a", 64) .. "></div>", 1000)
+    for _, chunk_size in ipairs { #input, 31 } do
+      local buf, called = sink_buffer(), 0
+      local builder = lolhtml.new_rewriter_builder()
+        :add_element_content_handlers {
+          selector = assert(lolhtml.new_selector("div")),
+          element_handler = function() called = called + 1 end,
+        }
+      local rewriter = assert(lolhtml.new_rewriter {
+        builder = builder, sink = buf,
+        preallocated_parsing_buffer_size = 0,
+        max_allowed_memory_usage = 16 * 1024,
+      })
+      for i = 1, #input, chunk_size do
+        assert(rewriter:write(input:sub(i, i + chunk_size - 1)))
+      end
+      assert(rewriter:close())
+      assert_equal(called, 1000)
+      assert_equal(buf:value(), input)
+    end
+  end)
+
+  test("attributes remain stable across write boundaries", function()
+    local attributes, values = {}, {}
+    for i = 1, 128 do
+      local name = "a" .. i
+      values[name] = i % 3 == 0 and "" or "value" .. i
+      attributes[i] = " " .. name
+        .. (i % 3 == 0 and "" or '="' .. values[name] .. '"')
+    end
+    local input = "<div" .. table.concat(attributes) .. ">body</div>"
+    for _, chunk_size in ipairs { #input, 7, 1 } do
+      local buf, called = sink_buffer(), 0
+      local builder = lolhtml.new_rewriter_builder()
+        :add_element_content_handlers {
+          selector = assert(lolhtml.new_selector("div")),
+          element_handler = function(element)
+            called = called + 1
+            local count = 0
+            for name, value in element:attributes() do
+              count = count + 1
+              assert_equal(value, values[name])
+              assert_equal(element:get_attribute(name), value)
+            end
+            assert_equal(count, 128)
+          end,
+        }
+      local rewriter = assert(lolhtml.new_rewriter { builder=builder, sink=buf })
+      for i = 1, #input, chunk_size do
+        assert(rewriter:write(input:sub(i, i + chunk_size - 1)))
+      end
+      assert(rewriter:close())
+      assert_equal(called, 1)
+      assert_equal(buf:value(), input)
+    end
+  end)
+
+  test("empty attribute values are distinct from missing attributes", function()
+    local builder = lolhtml.new_rewriter_builder()
+      :add_element_content_handlers {
+        selector = assert(lolhtml.new_selector("div")),
+        element_handler = function(element)
+          assert_true(element:has_attribute("hidden"))
+          assert_equal(element:get_attribute("hidden"), "")
+          assert_equal(element:get_attribute("empty"), "")
+          assert_false(element:has_attribute("missing"))
+          assert_nil(element:get_attribute("missing"))
+        end,
+      }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder, sink=sink_buffer() })
+    assert(rewriter:write('<div hidden empty=""></div>'))
+    assert(rewriter:close())
+  end)
+
+  test("deeply nested appends preserve end tag order", function()
+    local depth = 512
+    local input = string.rep("<div>", depth) .. "body" .. string.rep("</div>", depth)
+    local expected = string.rep("<div>", depth) .. "body" .. string.rep("tail</div>", depth)
+    for _, chunk_size in ipairs { #input, 3 } do
+      local buf = sink_buffer()
+      local builder = lolhtml.new_rewriter_builder()
+        :add_element_content_handlers {
+          selector = assert(lolhtml.new_selector("div")),
+          element_handler = function(element) assert(element:append("tail")) end,
+        }
+      local rewriter = assert(lolhtml.new_rewriter { builder=builder, sink=buf })
+      for i = 1, #input, chunk_size do
+        assert(rewriter:write(input:sub(i, i + chunk_size - 1)))
+      end
+      assert(rewriter:close())
+      assert_equal(buf:value(), expected)
     end
   end)
 
@@ -740,5 +889,277 @@ describe("lolhtml rewriter", function()
         assert_equal(buf:value(), 'aaa <span count="1">span content</span> ccc <div>ddd</div> eee <span count="2">span content</span> ggg')
       end)
     end)
+  end)
+end)
+
+describe("additional token bindings", function()
+  after(function() collectgarbage("collect") end)
+
+  test("omitted sink supports extraction and error propagation", function()
+    local seen = {}
+    local builder = lolhtml.new_rewriter_builder()
+      :add_element_content_handlers {
+        selector = assert(lolhtml.new_selector("a")),
+        element_handler = function(element)
+          seen[#seen + 1] = element:get_attribute("href")
+        end,
+      }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    assert_equal(rewriter:write('<a href="one">1</a><a href="two">2</a>'), rewriter)
+    assert_equal(rewriter:close(), rewriter)
+    assert_equal(table.concat(seen, ","), "one,two")
+
+    assert_error(function() lolhtml.new_rewriter { builder=builder, sink=false } end)
+    assert_error(function() lolhtml.new_rewriter { builder=builder, sink={} } end)
+
+    local failure = {}
+    builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("a")),
+      element_handler = function() error(failure) end,
+    }
+    rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    local ok, err = rewriter:write("<a></a>")
+    assert_nil(ok)
+    assert_equal(err, failure)
+    ok, err = rewriter:close()
+    assert_nil(ok)
+    assert_equal(err, "broken rewriter")
+  end)
+
+  test("tag renaming updates both tags and reports invalid names", function()
+    local buf, saved = sink_buffer()
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("div")),
+      element_handler = function(element)
+        assert_equal(element:get_tag_name(), "div")
+        assert_equal(element:get_tag_name(true), "DiV")
+        assert_equal(element:set_tag_name("article"), element)
+        assert_equal(element:get_tag_name(), "article")
+        for _, name in ipairs { "", "bad name", "x>" } do
+          local ok, err = element:set_tag_name(name)
+          assert_nil(ok)
+          assert_type(err, "string")
+        end
+        saved = element
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder, sink=buf })
+    assert(rewriter:write("<DiV><B>body</B></DiV>"))
+    assert(rewriter:close())
+    assert_equal(buf:value(), "<article><B>body</B></article>")
+    assert_error(function() saved:set_tag_name("aside") end)
+    assert_error(function() saved:get_tag_name(true) end)
+    assert_error(function() saved:can_have_content() end)
+    assert_error(function() saved:is_self_closing() end)
+  end)
+
+  test("content capability is distinct from self-closing syntax", function()
+    local expected = {
+      br = {false, false}, img = {false, true}, div = {true, true},
+      path = {false, true}, g = {true, false},
+    }
+    local count = 0
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("br,img,div,path,g")),
+      element_handler = function(element)
+        local flags = expected[element:get_tag_name()]
+        assert_equal(element:can_have_content(), flags[1])
+        assert_equal(element:is_self_closing(), flags[2])
+        count = count + 1
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    assert(rewriter:write("<br><img/><div/>text</div><svg><path/><g></g></svg>"))
+    assert(rewriter:close())
+    assert_equal(count, 5)
+  end)
+
+  test("DOCTYPE removal is idempotent and lifetime checked", function()
+    local buf, saved = sink_buffer()
+    local builder = lolhtml.new_rewriter_builder():add_document_content_handlers {
+      doctype_handler = function(doctype)
+        assert_false(doctype:is_removed())
+        assert_equal(doctype:remove(), doctype)
+        assert_true(doctype:is_removed())
+        assert_equal(doctype:remove(), doctype)
+        saved = doctype
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder, sink=buf })
+    assert(rewriter:write("<!DOCTYPE html><div>body</div>"))
+    assert(rewriter:close())
+    assert_equal(buf:value(), "<div>body</div>")
+    assert_error(function() saved:remove() end)
+    assert_error(function() saved:is_removed() end)
+  end)
+
+  test("source locations are input byte slices across write boundaries", function()
+    local doctype = "<!DOCTYPE HTML>"
+    local tag = '<DiV DaTa-X="v">'
+    local text = "\195\169x"
+    local comment = "<!--note-->"
+    local input = doctype .. tag .. text .. comment .. "</DiV>"
+    for _, chunk_size in ipairs { #input, 7, 1 } do
+      local saved, fragments, seen = {}, {}, {}
+      local function location(token, expected)
+        local first, last = token:source_location()
+        assert_true(first >= 1 and last >= first - 1 and last <= #input)
+        if expected then assert_equal(input:sub(first, last), expected) end
+        saved[#saved + 1] = token
+        return first, last
+      end
+      local builder = lolhtml.new_rewriter_builder():add_document_content_handlers {
+        doctype_handler = function(token)
+          local first, last = location(token, doctype)
+          token:remove()
+          assert_equal(token:source_location(), first)
+          local _, again = token:source_location()
+          assert_equal(again, last)
+          seen.doctype = true
+        end,
+        comment_handler = function(token)
+          local first = location(token, comment)
+          token:set_text("changed comment length")
+          assert_equal(token:source_location(), first)
+          seen.comment = true
+        end,
+        text_handler = function(token)
+          fragments[#fragments + 1] = token:get_text()
+        end,
+      }:add_element_content_handlers {
+        selector = assert(lolhtml.new_selector("div")),
+        element_handler = function(token)
+          local first, last = location(token, tag)
+          token:set_tag_name("section")
+          token:set_attribute("new", "longer")
+          local again_first, again_last = token:source_location()
+          assert_equal(again_first, first)
+          assert_equal(again_last, last)
+          seen.element = true
+        end,
+      }
+      local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+      for i = 1, #input, chunk_size do
+        assert(rewriter:write(input:sub(i, i + chunk_size - 1)))
+      end
+      assert(rewriter:close())
+      assert_true(seen.doctype and seen.comment and seen.element)
+      assert_equal(table.concat(fragments), text)
+      for _, token in ipairs(saved) do
+        assert_error(function() token:source_location() end)
+      end
+    end
+  end)
+
+  test("attribute snapshots preserve case and survive element mutation", function()
+    local escaped_next, escaped_state, saved
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("div")),
+      element_handler = function(element)
+        assert_equal(element:get_tag_name(true), "DiV")
+        local plain = {}
+        for name, value in element:attributes() do plain[name] = value end
+        assert_equal(plain["data-x"], "one")
+        assert_equal(plain.hidden, "")
+        assert_equal(plain.title, "three")
+
+        escaped_next, escaped_state = element:attributes(true)
+        local names, values = {}, {}
+        for name, value in element:attributes(true) do
+          names[#names + 1], values[#values + 1] = name, value
+          assert(element:remove_attribute(name))
+          for i = 1, 20 do
+            assert(element:set_attribute("added" .. #names .. "-" .. i, string.rep("x", 20)))
+          end
+          collectgarbage("collect")
+        end
+        assert_equal(table.concat(names, ","), "DaTa-X,HidDen,TITLE")
+        assert_equal(table.concat(values, ","), "one,,three")
+        assert_false(element:has_attribute("data-x"))
+        local name, value = escaped_next(escaped_state)
+        assert_equal(name, "DaTa-X")
+        assert_equal(value, "one")
+        saved = element
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    assert(rewriter:write('<DiV DaTa-X="one" HidDen TITLE="three"></DiV>'))
+    assert(rewriter:close())
+    assert_error(function() escaped_next(escaped_state) end)
+    assert_error(function() saved:attributes(true) end)
+    escaped_next, escaped_state, saved = nil, nil, nil
+    collectgarbage("collect")
+  end)
+
+  test("empty attribute iterators remain exhausted inside their callback", function()
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("div")),
+      element_handler = function(element)
+        local next_attr, state = element:attributes(true)
+        assert_nil(next_attr(state))
+        assert_nil(next_attr(state))
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    assert(rewriter:write("<div></div>"))
+    assert(rewriter:close())
+  end)
+
+  test("callback wrappers remain rooted during callback garbage collection", function()
+    local weak
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("div")),
+      element_handler = function(element)
+        weak = setmetatable({element}, {__mode="v"})
+        element = nil
+        collectgarbage("collect")
+        assert_not_nil(weak[1])
+        assert_equal(weak[1]:get_tag_name(), "div")
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    assert(rewriter:write("<div></div>"))
+    assert(rewriter:close())
+    collectgarbage("collect")
+    assert_nil(weak[1])
+  end)
+
+  test("attribute snapshots are invalidated when a handler fails", function()
+    local next_attr, state
+    local failure = {}
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("div")),
+      element_handler = function(element)
+        next_attr, state = element:attributes()
+        assert_equal(next_attr(state), "a")
+        error(failure)
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    local ok, err = rewriter:write('<div a="1" b="2"></div>')
+    assert_nil(ok)
+    assert_equal(err, failure)
+    assert_error(function() next_attr(state) end)
+    next_attr, state = nil, nil
+    collectgarbage("collect")
+  end)
+
+  test("partly consumed attribute snapshots can be collected inside a handler", function()
+    local builder = lolhtml.new_rewriter_builder():add_element_content_handlers {
+      selector = assert(lolhtml.new_selector("div")),
+      element_handler = function(element)
+        for i = 1, 20 do
+          for name in element:attributes(true) do
+            assert_equal(name, "A")
+            break
+          end
+          collectgarbage("collect")
+        end
+        assert_equal(element:get_attribute("b"), "2")
+      end,
+    }
+    local rewriter = assert(lolhtml.new_rewriter { builder=builder })
+    assert(rewriter:write('<div A="1" b="2"></div>'))
+    assert(rewriter:close())
   end)
 end)

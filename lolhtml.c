@@ -4,6 +4,7 @@
 #include <lol_html.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <assert.h>
 
 #define PREFIX "lolhtml."
@@ -28,13 +29,32 @@ typedef struct {
     int callback_index;
 } handler_data_t;
 
+typedef struct attribute_iterator_s attribute_iterator_t;
+
+typedef struct {
+    void *value;
+    attribute_iterator_t *iterators;
+} callback_value_t;
+
+static void clear_attribute_iterators(callback_value_t *owner);
+
 static void push_lol_str_maybe(lua_State *L, lol_html_str_t s) {
-    if (s.len == 0) {
+    if (s.data == NULL) {
         lua_pushnil(L);
     } else {
         lua_pushlstring(L, s.data, s.len);
-        lol_html_str_free(s);
     }
+    lol_html_str_free(s);
+}
+
+static int push_source_location(lua_State *L, lol_html_source_location_bytes_t location) {
+    uintmax_t max_integer = ((uintmax_t) 1 << (sizeof(lua_Integer) * CHAR_BIT - 1)) - 1;
+    if ((uintmax_t) location.start >= max_integer || (uintmax_t) location.end > max_integer) {
+        return luaL_error(L, "source location exceeds the Lua integer range");
+    }
+    lua_pushinteger(L, (lua_Integer) location.start + 1);
+    lua_pushinteger(L, (lua_Integer) location.end);
+    return 2;
 }
 
 static int push_last_error(lua_State *L) {
@@ -93,13 +113,19 @@ do_document_content_callback(const char *param_type, void *param, handler_data_t
     lua_pop(L, 2);                                    /* cb */
 
     /* allocate the parameter object */
-    void **lua_param = lua_newuserdata(handler->L, sizeof(void *));
+    callback_value_t *lua_param = lua_newuserdata(L, sizeof(callback_value_t));
     luaL_getmetatable(L, param_type);
     lua_setmetatable(L, -2);
-    *lua_param = param;
+    lua_param->value = param;
+    lua_param->iterators = NULL;
 
+    /* Keep the wrapper alive even if the callback drops its argument and runs GC. */
+    lua_pushvalue(L, -1);
+    lua_insert(L, -3); /* anchored parameter, callback, parameter */
     int rc = lua_pcall(L, 1, 1, 0);
-    *lua_param = NULL; /* signals that this value cannot be used anymore */
+    clear_attribute_iterators(lua_param);
+    lua_param->value = NULL; /* signals that this value cannot be used anymore */
+    lua_remove(L, -2); /* remove the anchor, retaining the result or error */
     if (rc != LUA_OK) {
         /* in case of error, just leave the error on the stack, the calling
          * site will check if the stack level changed and assume an error
@@ -181,10 +207,31 @@ static int doctype_get_system_id(lua_State *L) {
     return 1;
 }
 
+static int doctype_remove(lua_State *L) {
+    lol_html_doctype_t **doctype = check_valid_udata(L, 1, PREFIX "doctype");
+    lol_html_doctype_remove(*doctype);
+    lua_settop(L, 1);
+    return 1;
+}
+
+static int doctype_is_removed(lua_State *L) {
+    const lol_html_doctype_t **doctype = check_valid_udata(L, 1, PREFIX "doctype");
+    lua_pushboolean(L, lol_html_doctype_is_removed(*doctype));
+    return 1;
+}
+
+static int doctype_source_location(lua_State *L) {
+    lol_html_doctype_t **doctype = check_valid_udata(L, 1, PREFIX "doctype");
+    return push_source_location(L, lol_html_doctype_source_location_bytes(*doctype));
+}
+
 static luaL_Reg doctype_methods[] = {
     { "get_name", doctype_get_name },
     { "get_id", doctype_get_id },
     { "get_system_id", doctype_get_system_id },
+    { "remove", doctype_remove },
+    { "is_removed", doctype_is_removed },
+    { "source_location", doctype_source_location },
     { NULL, NULL }
 };
 
@@ -240,7 +287,13 @@ static int comment_is_removed(lua_State *L) {
     return 1;
 }
 
+static int comment_source_location(lua_State *L) {
+    lol_html_comment_t **comment = check_valid_udata(L, 1, PREFIX "comment");
+    return push_source_location(L, lol_html_comment_source_location_bytes(*comment));
+}
+
 static luaL_Reg comment_methods[] = {
+    { "source_location", comment_source_location },
     { "get_text", comment_get_text },
     { "set_text", comment_set_text },
     { "before", comment_before },
@@ -331,10 +384,36 @@ static luaL_Reg doc_end_methods[] = {
 /* element */
 static int element_get_tag_name(lua_State *L) {
     lol_html_element_t **el = check_valid_udata(L, 1, PREFIX "element");
-    lol_html_str_t tag_name = lol_html_element_tag_name_get(*el);
+    lol_html_str_t tag_name = lua_toboolean(L, 2)
+        ? lol_html_element_tag_name_get_preserve_case(*el)
+        : lol_html_element_tag_name_get(*el);
     lua_pushlstring(L, tag_name.data, tag_name.len);
     lol_html_str_free(tag_name);
     return 1;
+}
+
+static int element_set_tag_name(lua_State *L) {
+    size_t len;
+    lol_html_element_t **el = check_valid_udata(L, 1, PREFIX "element");
+    const char *name = luaL_checklstring(L, 2, &len);
+    return return_self_or_err(L, lol_html_element_tag_name_set(*el, name, len));
+}
+
+static int element_can_have_content(lua_State *L) {
+    lol_html_element_t **el = check_valid_udata(L, 1, PREFIX "element");
+    lua_pushboolean(L, lol_html_element_can_have_content(*el));
+    return 1;
+}
+
+static int element_is_self_closing(lua_State *L) {
+    lol_html_element_t **el = check_valid_udata(L, 1, PREFIX "element");
+    lua_pushboolean(L, lol_html_element_is_self_closing(*el));
+    return 1;
+}
+
+static int element_source_location(lua_State *L) {
+    lol_html_element_t **el = check_valid_udata(L, 1, PREFIX "element");
+    return push_source_location(L, lol_html_element_source_location_bytes(*el));
 }
 
 static int element_get_namespace_uri(lua_State *L) {
@@ -380,50 +459,125 @@ static int element_remove_attribute(lua_State *L) {
     return return_self_or_err(L, lol_html_element_remove_attribute(*el, attr, len));
 }
 
-static int attribute_iterator_next(lua_State *L) {
-    lol_html_str_t s;
-    lol_html_attributes_iterator_t **it = check_valid_udata(L, 1, PREFIX "attribute_iterator");
-    const lol_html_attribute_t *attr = lol_html_attributes_iterator_next(*it);
+typedef struct attribute_snapshot_s {
+    lol_html_str_t name;
+    lol_html_str_t value;
+    struct attribute_snapshot_s *next;
+} attribute_snapshot_t;
 
-    if (attr == NULL) {
-        /* end of the attributes: eagerly free the iterator */
-        lol_html_attributes_iterator_free(*it);
-        *it = NULL;
+struct attribute_iterator_s {
+    attribute_snapshot_t *head;
+    attribute_snapshot_t *next;
+    callback_value_t *owner;
+    attribute_iterator_t *next_iterator;
+    bool busy;
+};
+
+static void free_attribute_snapshot(attribute_iterator_t *it) {
+    while (it->head != NULL) {
+        attribute_snapshot_t *entry = it->head;
+        it->head = entry->next;
+        lol_html_str_free(entry->name);
+        lol_html_str_free(entry->value);
+        free(entry);
+    }
+    it->next = NULL;
+}
+
+static void clear_attribute_iterators(callback_value_t *owner) {
+    while (owner->iterators != NULL) {
+        attribute_iterator_t *it = owner->iterators;
+        owner->iterators = it->next_iterator;
+        it->owner = NULL;
+        free_attribute_snapshot(it);
+    }
+}
+
+static int attribute_iterator_next(lua_State *L) {
+    attribute_iterator_t *it = luaL_checkudata(L, 1, PREFIX "attribute_iterator");
+    lua_getuservalue(L, 1);
+    lua_rawgeti(L, -1, 1);
+    lol_html_element_t **owner = luaL_checkudata(L, -1, PREFIX "element");
+    if (*owner == NULL) {
+        return luaL_error(L, "attempt to use a value past its lifetime");
+    }
+    if (it->busy) {
+        return luaL_error(L, "attribute iterator is already being advanced");
+    }
+    attribute_snapshot_t *entry = it->next;
+    if (entry == NULL) {
+        free_attribute_snapshot(it);
         lua_pushnil(L);
         return 1;
     }
-
-    s = lol_html_attribute_name_get(attr);
-    lua_pushlstring(L, s.data, s.len);
-    lol_html_str_free(s);
-
-    s = lol_html_attribute_value_get(attr);
-    lua_pushlstring(L, s.data, s.len);
-    lol_html_str_free(s);
-
+    it->busy = true;
+    it->next = entry->next;
+    lua_pushlstring(L, entry->name.data, entry->name.len);
+    lua_pushlstring(L, entry->value.data, entry->value.len);
+    it->busy = false;
     return 2;
 }
 
 static int attribute_iterator_destroy(lua_State *L) {
-    lol_html_attributes_iterator_t **it = luaL_checkudata(L, 1, PREFIX "attribute_iterator");
-    if (*it != NULL) {
-        lol_html_attributes_iterator_free(*it);
-        *it = NULL;
+    attribute_iterator_t *it = luaL_checkudata(L, 1, PREFIX "attribute_iterator");
+    if (it->owner != NULL) {
+        attribute_iterator_t **link = &it->owner->iterators;
+        while (*link != it) {
+            link = &(*link)->next_iterator;
+        }
+        *link = it->next_iterator;
+        it->owner = NULL;
     }
+    free_attribute_snapshot(it);
     return 0;
 }
 
 static int element_attributes(lua_State *L) {
     lol_html_element_t **el = check_valid_udata(L, 1, PREFIX "element");
+    bool preserve_case = lua_toboolean(L, 2);
+    const lol_html_attribute_t *attr;
 
     lua_pushcfunction(L, attribute_iterator_next);
 
-    /* We have to use a full userdata as we need to reliably GC the iterator if
-     * the program breaks early from the loop. */
-    lol_html_attributes_iterator_t **it = lua_newuserdata(L, sizeof(void*));
+    /* Own the snapshot through a collectible userdata. Do not allocate Lua
+     * objects while borrowing attributes: GC finalizers may mutate the element. */
+    attribute_iterator_t *it = lua_newuserdata(L, sizeof(attribute_iterator_t));
+    it->head = NULL;
+    it->next = NULL;
+    it->owner = NULL;
+    it->next_iterator = NULL;
+    it->busy = false;
     luaL_getmetatable(L, PREFIX "attribute_iterator");
     lua_setmetatable(L, -2);
-    *it = lol_html_attributes_iterator_get(*el);
+
+    lua_createtable(L, 1, 0);
+    lua_pushvalue(L, 1);
+    lua_rawseti(L, -2, 1); /* retain the owner for callback lifetime checks */
+    lua_setuservalue(L, -2);
+
+    it->owner = lua_touserdata(L, 1);
+    it->next_iterator = it->owner->iterators;
+    it->owner->iterators = it;
+
+    lol_html_attributes_iterator_t *native = lol_html_attributes_iterator_get(*el);
+    attribute_snapshot_t **tail = &it->head;
+    while ((attr = lol_html_attributes_iterator_next(native)) != NULL) {
+        attribute_snapshot_t *entry = malloc(sizeof(attribute_snapshot_t));
+        if (entry == NULL) {
+            lol_html_attributes_iterator_free(native);
+            free_attribute_snapshot(it);
+            return luaL_error(L, "out of memory while copying attributes");
+        }
+        entry->name = preserve_case
+            ? lol_html_attribute_name_get_preserve_case(attr)
+            : lol_html_attribute_name_get(attr);
+        entry->value = lol_html_attribute_value_get(attr);
+        entry->next = NULL;
+        *tail = entry;
+        tail = &entry->next;
+    }
+    lol_html_attributes_iterator_free(native);
+    it->next = it->head;
 
     lua_pushnil(L);
     return 3;
@@ -497,6 +651,10 @@ static int element_remove_and_keep_content(lua_State *L) {
 
 static luaL_Reg element_methods[] = {
     { "get_tag_name", element_get_tag_name },
+    { "set_tag_name", element_set_tag_name },
+    { "can_have_content", element_can_have_content },
+    { "is_self_closing", element_is_self_closing },
+    { "source_location", element_source_location },
     { "get_namespace_uri", element_get_namespace_uri },
     { "get_attribute", element_get_attribute },
     { "has_attribute", element_has_attribute },
@@ -651,6 +809,12 @@ typedef struct {
     bool broken; /* used to signal sink errors */
 } lua_rewriter_t;
 
+static void discard_output(const char *chunk, size_t chunk_len, void *user_data) {
+    (void) chunk;
+    (void) chunk_len;
+    (void) user_data;
+}
+
 static void sink_callback(const char *chunk, size_t chunk_len, void *user_data) {
     int rc;
     lua_rewriter_t *rewriter = user_data;
@@ -682,7 +846,7 @@ static int rewriter_new(lua_State *L) {
     const char *encoding;
     lol_html_memory_settings_t memory_settings = {0};
     lua_rewriter_t *rewriter;
-    bool strict;
+    bool strict, discard;
 
     luaL_checktype(L, 1, LUA_TTABLE);
 
@@ -707,9 +871,9 @@ static int rewriter_new(lua_State *L) {
     strict = lua_toboolean(L, -1);
     lua_pop(L, 1);
 
-    // TODO: support a "blackhole" sink by default that avoids all the callback
-    // machinery
-    if (lua_getfield(L, 1, "sink") != LUA_TFUNCTION) {
+    int sink_type = lua_getfield(L, 1, "sink");
+    discard = sink_type == LUA_TNIL;
+    if (!discard && sink_type != LUA_TFUNCTION) {
         /* not a function, check if it's a callable */
         if (luaL_getmetafield(L, -1, "__call") == LUA_TNIL) {
             luaL_argerror(L, 1, "field \"sink\" cannot be called");
@@ -724,7 +888,7 @@ static int rewriter_new(lua_State *L) {
         *builder,
         encoding, encoding_len,
         memory_settings,
-        sink_callback, rewriter,
+        discard ? discard_output : sink_callback, rewriter,
         strict
     );
 

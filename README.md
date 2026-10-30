@@ -224,6 +224,9 @@ following fields are allowed:
 * `max_allowed_memory_usage`: Sets a hard limit in bytes on memory consumption
   of a Rewriter instance. See [lol-html documentation][lolhtml-memory] for
   details. (optional, default is `SIZE_MAX`)
+* `sink`: A function or callable object receiving output chunks. If omitted
+  or `nil`, output is discarded in C. Content handlers still run and errors
+  are returned normally, making this useful for extraction without rewriting.
 * `strict`: boolean, if set to true the rewriter bails out if it encounters
    markup that drives the HTML parser into ambigious state. See
   [lol-html documentation][lolhtml-strict] for details. (optional, default is
@@ -256,6 +259,12 @@ error message on failure. Failure happens if (incomplete list):
 #### `Doctype:get_name() => string|nil`
 #### `Doctype:get_id() => string|nil`
 #### `Doctype:get_system_id() => string|nil`
+#### `Doctype:remove() => self`
+#### `Doctype:is_removed() => boolean`
+#### `Doctype:source_location() => first, last`
+
+Removing a DOCTYPE omits it from the output. Its original source location
+remains available during the callback.
 
 ### Comment objects
 
@@ -266,6 +275,7 @@ error message on failure. Failure happens if (incomplete list):
 #### `Comment:replace(string, is_html) => self|nil, err`
 #### `Comment:remove() => self|nil, err`
 #### `Comment:is_removed() => boolean`
+#### `Comment:source_location() => first, last`
 
 ### TextChunk objects
 
@@ -279,21 +289,45 @@ error message on failure. Failure happens if (incomplete list):
 
 ### Element objects
 
-#### `Element:get_tag_name() => string`
+#### `Element:get_tag_name(preserve_case=false) => string`
+#### `Element:set_tag_name(name) => self|nil, err`
+#### `Element:can_have_content() => boolean`
+#### `Element:is_self_closing() => boolean`
+#### `Element:source_location() => first, last`
 #### `Element:get_namespace_uri() => string`
 #### `Element:get_attribute(name) => string|nil`
 #### `Element:has_attribute(name) => boolean`
 #### `Element:set_attribute(name, value) => self|nil, err`
 #### `Element:remove_attribute(name) => self|nil, err`
-#### `Element:attributes() => iterator`
+#### `Element:attributes(preserve_case=false) => iterator`
+
+Pass `true` to `get_tag_name` or `attributes` to preserve the original case
+of names. Omitting the argument keeps the existing normalized-name behavior.
+
+`set_tag_name` renames the start tag and its corresponding end tag, returning
+`nil, err` for an invalid name. It changes the serialized name, not the
+parser's namespace or content model; use it for compatible tags such as
+`div` and `section`.
+
+`is_self_closing` reports the parsed `/>` syntax. `can_have_content` reports
+whether the parsed element accepts inner content. For example, `<div/>`
+still accepts content in HTML, while `<br>` does not, and a self-closing
+SVG element does not.
+
+`get_attribute` returns `nil` for a missing attribute and an empty string for
+an existing attribute without a value or with an explicitly empty value.
 
 Returns a Lua iterator triplet so the following construction is valid:
 
 ```lua
-for attr_name, value in element:attribute() do
+for attr_name, value in element:attributes() do
   ...
 end
 ```
+
+The iterator takes a snapshot of attribute names and values when created.
+Changing the element while iterating does not alter the snapshot. It remains
+valid only during the element callback; using it afterwards raises a Lua error.
 
 #### `Element:before(string, is_html) => self|nil, err`
 #### `Element:after(string, is_html) => self|nil, err`
@@ -308,6 +342,17 @@ end
 ### DocumentEnd objects
 
 #### `DocumentEnd:append(string, is_html) => self|nil, err`
+
+### Source locations
+
+`source_location()` on Element, Comment and Doctype returns two byte positions
+in the original input, starting at 1 and including both ends. Thus
+`input:sub(first, last)` extracts the original source bytes. The positions
+are independent of input chunk boundaries and are unchanged by rewrites.
+An Element's range covers its start tag, not its entire contents or end tag.
+The method follows the same callback lifetime restrictions as other methods.
+
+TextChunk and attribute source locations are not exposed.
 
 
 [lolhtml]: https://github.com/cloudflare/lol-html
