@@ -4,6 +4,9 @@ Lua bindings for [lol-html][lolhtml], Cloudflare's streaming HTML parser and
 rewriter with a CSS selector-based API. Use it to modify HTML as it arrives or
 extract attributes and text without building a DOM for the whole document.
 
+The binding works with standard Lua 5.1, 5.2, and 5.3, as well as LuaJIT.
+LuaJIT and OpenResty are optional runtimes, not requirements.
+
 The LuaRocks package is **`lua-lolhtml`**; load it with **`require "lolhtml"`**.
 The current release is **1.1.0**, built with **lol-html 3.0.3**. It supports:
 
@@ -22,7 +25,7 @@ The current release is **1.1.0**, built with **lol-html 3.0.3**. It supports:
 - [Examples](#examples)
 - [Execution and object lifetime](#execution-and-object-lifetime)
 - [API reference](#api-reference)
-- [OpenResty](#openresty)
+- [Optional runtime integrations](#optional-runtime-integrations)
 - [Development and tests](#development-and-tests)
 - [License](#license)
 
@@ -35,14 +38,13 @@ Make, and development headers for the Lua interpreter that will load it. Install
 Rust using [rustup][rust-install] or a suitable distribution package. Rust and
 Cargo are build dependencies; they are not needed to run an installed module.
 
-The rockspec declares support for Lua 5.1 through 5.3, including LuaJIT's Lua 5.1
-API. CI builds and tests with LuaJIT 2.1 on Linux using both Rust 1.89 and the
-current stable Rust toolchain. Lua 5.4 is not declared supported by the rockspec.
+Supported Lua versions are 5.1, 5.2, and 5.3. Lua 5.4 is not currently declared
+supported by the rockspec. Build the module separately for each Lua ABI you use.
 
-For example, install the C and LuaJIT dependencies on Debian or Ubuntu with:
+For example, install the C and Lua 5.3 dependencies on Debian or Ubuntu with:
 
 ```sh
-sudo apt-get install build-essential libluajit-5.1-dev luajit
+sudo apt-get install build-essential lua5.3 liblua5.3-dev
 ```
 
 ### LuaRocks
@@ -53,19 +55,22 @@ Use LuaRocks 3.0 or newer, configured for the intended Lua interpreter:
 luarocks install lua-lolhtml 1.1.0-1
 ```
 
+If several Lua versions are installed, select the one you will run. For example:
+
+```sh
+luarocks --lua-version=5.3 install lua-lolhtml 1.1.0-1
+lua5.3 -e 'assert(require "lolhtml")'
+```
+
+Use `5.1` or `5.2` and the corresponding interpreter for those versions. For a
+custom Lua installation, also configure LuaRocks with its installation prefix.
+If installing into a custom rock tree, make its module paths available to the
+same interpreter, for example with `luarocks path` for that tree and Lua version.
+
 The source rock includes the pinned native dependencies. Cargo also downloads
 the Rust dependencies recorded in their lockfile on the first build. Installation
 compiles a native `lolhtml.so`, so the Lua headers and module search path must
 match the interpreter used by your application.
-
-If your OpenResty installation includes its own LuaRocks executable, use it:
-
-```sh
-/usr/local/openresty/luajit/bin/luarocks install lua-lolhtml 1.1.0-1
-```
-
-For a separately installed LuaRocks, configure it for OpenResty's LuaJIT. A module
-built for a different Lua ABI cannot be loaded just by changing `package.cpath`.
 
 ### Build from source
 
@@ -75,19 +80,20 @@ Clone the release with its submodules:
 git clone --branch 1.1.0 --recurse-submodules \
   https://github.com/HanadaLee/lua-lolhtml.git
 cd lua-lolhtml
-luarocks make rockspecs/lua-lolhtml-1.1.0-1.rockspec
+luarocks --lua-version=5.3 make rockspecs/lua-lolhtml-1.1.0-1.rockspec
 ```
 
 For an existing checkout, run `git submodule update --init --recursive` after
-switching revisions. You can also build directly with Make; for LuaJIT on Debian
+switching revisions. You can also build directly with Make; for Lua 5.3 on Debian
 or Ubuntu:
 
 ```sh
-make CFLAGS="-O2 -fPIC -I/usr/include/luajit-2.1"
-LUA_CPATH="$PWD/?.so;;" luajit -e 'assert(require "lolhtml")'
+make CFLAGS="-O2 -fPIC -I/usr/include/lua5.3"
+LUA_CPATH="$PWD/?.so;;" lua5.3 -e 'assert(require "lolhtml")'
 ```
 
-Adjust the include directory for your installation. The Makefile produces
+Adjust the include directory and interpreter for Lua 5.1 or 5.2 or a custom
+installation. Run `make clean` before switching Lua versions. The Makefile produces
 `lolhtml.so` in the repository root; it does not install it into a Lua module path.
 
 ## Quick start
@@ -305,9 +311,9 @@ perform CPU work and call Lua handlers before returning. The module does not
 fetch HTML, schedule background work, or provide asynchronous I/O. Processing a
 large chunk occupies the calling thread until that call completes.
 
-Content handlers and the sink must not yield, call yielding OpenResty APIs, or
-recursively call `write()` or `close()` on the active rewriter. Perform I/O and
-scheduling between writes, outside these callbacks.
+Content handlers and the sink must not yield or recursively call `write()` or
+`close()` on the active rewriter. Perform I/O and scheduling between writes,
+outside these callbacks.
 
 Selectors can be reused. A builder can create multiple rewriters, but each
 rewriter processes exactly one document. Register handlers and operate the
@@ -512,7 +518,30 @@ callback even after removal.
 `doc_end:append(content, is_html)` appends text or HTML at EOF and returns `self`
 or `nil, err`. This object is provided to `doc_end_handler` during `close()`.
 
-## OpenResty
+## Optional runtime integrations
+
+### LuaJIT
+
+LuaJIT uses the Lua 5.1 API. Configure LuaRocks for your LuaJIT installation, or
+build directly with its development headers. For example, on Debian or Ubuntu:
+
+```sh
+sudo apt-get install libluajit-5.1-dev luajit
+make clean
+make CFLAGS="-O2 -fPIC -I/usr/include/luajit-2.1"
+LUA_CPATH="$PWD/?.so;;" luajit -e 'assert(require "lolhtml")'
+```
+
+### OpenResty
+
+If your OpenResty installation includes its own LuaRocks executable, use it:
+
+```sh
+/usr/local/openresty/luajit/bin/luarocks install lua-lolhtml 1.1.0-1
+```
+
+For a separately installed LuaRocks, configure it for OpenResty's LuaJIT. A module
+built for a different Lua ABI cannot be loaded just by changing `package.cpath`.
 
 Use a builder, rewriter, and result buffers local to the request and its Lua
 coroutine. Do not cache a builder with registered handlers in a module shared
@@ -549,8 +578,8 @@ location = /rewrite-demo {
 
 The sink only collects strings; response output happens after the native call
 returns. For a streaming source, read input and drain accumulated output between
-`write()` calls, keeping any yielding I/O outside the handlers and sink. Bound
-application buffers as well as native parser memory.
+`write()` calls, keeping yielding OpenResty APIs outside the handlers and sink.
+Bound application buffers as well as native parser memory.
 
 HTTP integration remains the caller's responsibility: feed decoded HTML rather
 than compressed response bytes, and update or remove an existing `Content-Length`
@@ -558,26 +587,31 @@ when rewriting changes the body length. The module does not modify HTTP headers.
 
 ## Development and tests
 
-From a checkout with submodules initialized, install the LuaJIT build dependencies
-listed above and clone the test runner:
+From a checkout with submodules initialized, install the build dependencies for
+your Lua version and clone the test runner. For Lua 5.3 on Debian or Ubuntu:
 
 ```sh
 mkdir -p .ci
 git clone https://github.com/jdesgats/telescope.git .ci/telescope
-bash util/run-tests.sh
+make clean
+make CFLAGS="-O2 -fPIC -I/usr/include/lua5.3"
+LUA_PATH="$PWD/.ci/telescope/?.lua;;" \
+LUA_CPATH="$PWD/?.so;;" \
+  lua5.3 .ci/telescope/tsc spec/lolhtml.lua
 ```
 
-The script builds the binding and runs `spec/lolhtml.lua` with the local `.so`.
-It expects the Debian/Ubuntu LuaJIT header location. To run the suite against a
-module installed by LuaRocks instead:
+Use the corresponding headers and interpreter for Lua 5.1 or 5.2. To run the
+suite against a module installed by LuaRocks instead:
 
 ```sh
 LUA_PATH="$PWD/.ci/telescope/?.lua;;" \
-LUA_CPATH="/path/to/rock-tree/lib/lua/5.1/?.so" \
-  luajit .ci/telescope/tsc spec/lolhtml.lua
+LUA_CPATH="/path/to/rock-tree/lib/lua/5.3/?.so" \
+  lua5.3 .ci/telescope/tsc spec/lolhtml.lua
 ```
 
-GitHub Actions tests direct builds and LuaRocks installation with Rust 1.89 and
+The existing `util/run-tests.sh` is a convenience script for the LuaJIT CI
+environment and expects Debian/Ubuntu LuaJIT headers. GitHub Actions currently
+tests direct builds and LuaRocks installation with LuaJIT 2.1, using Rust 1.89 and
 stable. A numeric release tag, such as `1.1.0`, additionally packs the matching
 rockspec, installs and tests the source rock, then publishes it to LuaRocks.
 
